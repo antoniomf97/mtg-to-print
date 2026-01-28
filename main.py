@@ -1,14 +1,25 @@
 import os, sys
-# import requests
+import xmltodict
 
 
 def parse_args():
     if len(sys.argv) != 2:
-        raise ValueError(f"Invalid input. Run as: 'python {sys.argv[0]} <input_folder>'")
-    return sys.argv[1]
+        raise ValueError(f"⛔ Invalid input. Run as: 'python {sys.argv[0]} <input_file>'")
+
+    filename = sys.argv[1] + ".xml" if ".xml" not in sys.argv[1] else sys.argv[1]
+
+    input_path = "./input/" + filename
+
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"⛔ Path {input_path} does not exist.")
+
+    return input_path
 
 
-def run():
+def parse_xml(input_path):
+    pass
+
+def create_csv(input_file):
     # parse arguments
     deck_name = parse_args()
     input = "./input/" + deck_name
@@ -45,6 +56,11 @@ def run():
 
     print(f"✅ CSV file created successfully at {output}")
     
+
+def run():
+    input_file = parse_args()
+    print(input_file)
+
 
 if __name__ == "__main__":
     run()
