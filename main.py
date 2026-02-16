@@ -118,85 +118,42 @@ def request_mpcfill(input_path, output_path, download_count):
         browser.close()
 
 
-def create_csv(input_file):
-    # parse arguments
-    deck_name = parse_args()
-    input = "./input/" + deck_name
-    output = "./output/" + deck_name + ".csv"
-
-    # check if directory exists
-    if not os.path.exists(input):
-        print(f"⛔ Directory {input} does not exist.")
-        exit()
-
-    # check if output already exists
-    if os.path.exists(output):
-        print(f"⛔ File {output} already exists.")
-        exit()
-
-    # get filenames from input directory
-    paths = []
-    for dirpath, _, filenames in os.walk(input):
-        for filename in filenames:
-            # get absolute path and remove spaces and commas
-            path = os.path.abspath(os.path.join(dirpath, filename))
-            new_path = (
-                path.replace(" ", "")
-                .replace(",", "")
-                .replace("'", "")
-                .replace("ǵ", "")
-                .replace("ń", "")
-            )
-
-            # rename files and append paths
-            os.rename(path, new_path)
-            paths.append(new_path)
-
-    # writing output csv
-    with open(output, "w") as f:
-        f.write("@image" + "\n")
-        for path in paths:
-            # print(f"Path: {path}")
-            f.write(path + "\n")
-
-    print(f"✅ CSV file created successfully at {output}")
-
-
 def organize_sets(output_path, cards):
     fronts, backs, cardback = cards
     used_slots = []
     card_counter = 1
-    set_counter = 1
+    set_counter = 0
     for id, slots in backs.items():
-        os.makedirs(f"{output_path}/set{set_counter}", exist_ok=True)
+        set_counter += 1
+        os.makedirs(os.path.join(output_path, f"set{set_counter}"), exist_ok=True)
         shutil.copy2(
-            f"{output_path}/{id}.png", f"{output_path}/set{set_counter}/zzback.png"
+            os.path.join(output_path, id + ".png"), 
+            os.path.join(output_path, f"set{set_counter}", "zzback.png")
         )
         for slot in slots:
             shutil.copy2(
-                f"{output_path}/{fronts[slot]}.png",
-                f"{output_path}/set{set_counter}/{card_counter}.png",
+                os.path.join(output_path, f"{fronts[slot]}.png"),
+                os.path.join(output_path, f"set{set_counter}", f"{card_counter}.png"),
             )
             used_slots.append(slot)
             card_counter += 1
-        set_counter += 1
 
     if cardback:
-        os.makedirs(f"{output_path}/set{set_counter}", exist_ok=True)
+        set_counter += 1
+        os.makedirs(os.path.join(output_path, f"set{set_counter}"), exist_ok=True)
         shutil.copy2(
-            f"{output_path}/{cardback}.png",
-            f"{output_path}/set{set_counter}/zzback.png",
+            os.path.join(output_path, f"{cardback}.png"),
+            os.path.join(output_path, f"set{set_counter}", "zzback.png")
         )
         for slot, id in fronts.items():
             if slot not in used_slots:
                 shutil.copy2(
-                    f"{output_path}/{id}.png",
-                    f"{output_path}/set{set_counter}/{card_counter}.png",
+                    os.path.join(output_path, id + ".png"),
+                    os.path.join(output_path, f"set{set_counter}", f"{card_counter}.png")
                 )
                 card_counter += 1
-        set_counter += 1
 
-    print(f"Created {set_counter-1} sets of cards.")
+    print(f"Created {set_counter} sets of cards.")
     print("Cleaning files...")
 
     for filename in os.listdir(output_path):
@@ -204,17 +161,37 @@ def organize_sets(output_path, cards):
         if os.path.isfile(file_path):
             os.remove(file_path)
 
+    return set_counter
+
+
+def create_csv(output_path, n_sets):
+    project = os.path.split(output_path)[-1]
+
+    for i in range(n_sets):
+        path = os.path.join(output_path, f"set{i+1}")
+
+        with open(os.path.join(output_path, project + f"_set{i+1}.csv"), "w") as file:
+            for filename in os.listdir(path):
+                full_path = os.path.abspath(os.path.join(path, filename))
+                if os.path.isfile(full_path):
+                    file.write(full_path + "\n")
+
+        print(f"✅ CSV file created successfully at {path}")
+
 
 def run():
-    print("Parsing arguments " + "=" * 50)
+    print("Parsing arguments " + "=" * 52)
     input_path, output_path = parse_args()
     download_count, cards = parse_xml(input_path)
 
-    print("Requesting files " + "=" * 50)
+    print("Requesting files " + "=" * 53)
     request_mpcfill(input_path, output_path, download_count)
 
-    print("Organizing sets " + "=" * 50)
-    organize_sets(output_path, cards)
+    print("Organizing sets " + "=" * 54)
+    n_sets = organize_sets(output_path, cards)
+
+    print("Building data merge files " + "=" * 44)          
+    create_csv(output_path, n_sets)
 
 
 if __name__ == "__main__":
