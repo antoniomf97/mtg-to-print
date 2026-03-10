@@ -19,8 +19,8 @@ def parse_args():
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"⛔ Path {input_path} does not exist.")
 
-    # if os.path.exists(output_path):
-    #     raise FileNotFoundError(f"⛔ Path {output_path} already exists.")
+    if os.path.exists(output_path):
+        raise FileNotFoundError(f"⛔ Path {output_path} already exists.")
 
     return input_path, output_path
 
@@ -90,7 +90,7 @@ def request_mpcfill(input_path, output_path, download_count):
         page.locator("input[type='file']").set_input_files(input_path)
 
         print("Waiting for upload to settle...")
-        time.sleep(5)  # adjust if needed (e.g., 3–10 seconds)
+        time.sleep(10)  # adjust if needed (e.g., 3–10 seconds)
 
         downloads = []
         page.on("download", lambda d: downloads.append(d))
@@ -101,7 +101,7 @@ def request_mpcfill(input_path, output_path, download_count):
 
         print("Waiting for downloads...")
         for _ in tqdm(range(download_count)):
-            page.wait_for_event("download")
+            page.wait_for_event("download", timeout=120000)
 
         print(f"Received {len(downloads)} files.")
 
@@ -171,6 +171,7 @@ def create_csv(output_path, n_sets):
         path = os.path.join(output_path, f"set{i+1}")
 
         with open(os.path.join(output_path, project + f"_set{i+1}.csv"), "w") as file:
+            file.write("@image" + "\n")
             for filename in os.listdir(path):
                 full_path = os.path.abspath(os.path.join(path, filename))
                 if os.path.isfile(full_path):
