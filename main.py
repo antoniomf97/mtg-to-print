@@ -1,4 +1,4 @@
-import os, sys, time, re
+import os, sys, re
 import xmltodict
 from playwright.sync_api import sync_playwright
 from tqdm import tqdm
@@ -18,9 +18,6 @@ def parse_args():
 
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"⛔ Path {input_path} does not exist.")
-
-    if os.path.exists(output_path):
-        raise FileNotFoundError(f"⛔ Path {output_path} already exists.")
 
     return input_path, output_path
 
@@ -69,14 +66,85 @@ def parse_xml(file_path):
     return download_counter(data_dict)
 
 
-def request_mpcfill(input_path, output_path, download_count):
+def get_missing_ids(output_path, cards):
+    fronts, backs, cardback = cards
+    expected = set(fronts.values()) | set(backs.keys())
+    if cardback:
+        expected.add(cardback)
+
+    missing = {
+        id
+        for id in expected
+        if not os.path.exists(os.path.join(output_path, id + ".png"))
+    }
+
+    return expected, missing
+
+
+def build_partial_xml(input_path, output_path, missing_ids):
+    with open(input_path, "r", encoding="utf-8") as file:
+        data = xmltodict.parse(file.read())["order"]
+
+    entries = []
+    seen = set()
+    for section in ["fronts", "backs"]:
+        cards = data.get(section)
+        if not cards:
+            continue
+        cards = cards["card"]
+        cards = cards if type(cards) == list else [cards]
+        for card in cards:
+            if card["id"] in missing_ids and card["id"] not in seen:
+                entries.append(
+                    {
+                        "id": card["id"],
+                        "slots": str(len(entries)),
+                        "name": card["name"],
+                        "query": card.get("query"),
+                    }
+                )
+                seen.add(card["id"])
+
+    cardback = data.get("cardback")
+    if cardback and cardback in missing_ids and cardback not in seen:
+        entries.append(
+            {
+                "id": cardback,
+                "slots": str(len(entries)),
+                "name": "cardback.png",
+                "query": None,
+            }
+        )
+
+    order = {
+        "order": {
+            "details": {
+                "quantity": len(entries),
+                "bracket": data["details"]["bracket"],
+                "stock": data["details"]["stock"],
+                "foil": data["details"]["foil"],
+            },
+            "fronts": {"card": entries},
+        }
+    }
+    if cardback:
+        order["order"]["cardback"] = cardback
+
+    os.makedirs(output_path, exist_ok=True)
+    resume_path = os.path.join(output_path, "_resume.xml")
+    with open(resume_path, "w", encoding="utf-8") as file:
+        file.write(xmltodict.unparse(order, pretty=True))
+
+    return resume_path
+
+
+def request_mpcfill(upload_path, output_path, missing_ids):
 
     with sync_playwright() as p:
         print("Lauching browser...")
         browser = p.firefox.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
-        idle_time = 5
 
         print("Opening MPCFill editor...")
         page.goto("https://mpcfill.com/editor", timeout=600000)
@@ -87,35 +155,57 @@ def request_mpcfill(input_path, output_path, download_count):
         page.get_by_text("Retain Selected Finish Settings", exact=True).click()
 
         print("Uploading XML file...")
-        page.locator("input[type='file']").set_input_files(input_path)
+        page.locator("input[type='file']").set_input_files(upload_path)
 
         print("Waiting for upload to settle...")
-        time.sleep(10)  # adjust if needed (e.g., 3–10 seconds)
+        page.wait_for_timeout(10000)  # adjust if needed (e.g., 3–10 seconds)
 
         downloads = []
         page.on("download", lambda d: downloads.append(d))
+
+        def file_id(download):
+            found = re.findall(r"\((.*?)\)", download.suggested_filename)
+            if found:
+                return found[-1]
+            return os.path.splitext(download.suggested_filename)[0]
 
         print("Starting downloads...")
         page.locator("button.dropdown-toggle:has-text('Download')").click()
         page.get_by_text("Card Images", exact=True).click()
 
         print("Waiting for downloads...")
-        for _ in tqdm(range(download_count)):
-            page.wait_for_event("download", timeout=120000)
+        stall_limit = 240  # seconds without a new download before giving up
+        stalled = 0.0
+        with tqdm(total=len(missing_ids)) as progress:
+            while progress.n < len(missing_ids):
+                page.wait_for_timeout(500)
+                received = len(missing_ids & {file_id(d) for d in downloads})
+                if received > progress.n:
+                    progress.update(received - progress.n)
+                    stalled = 0.0
+                else:
+                    stalled += 0.5
+                    if stalled >= stall_limit:
+                        print(f"⚠️ No new download for {stall_limit}s, giving up.")
+                        break
 
         print(f"Received {len(downloads)} files.")
 
         print(f"Saving files at '{output_path}'.")
         os.makedirs(output_path, exist_ok=True)
         for download in downloads:
-            suggested_name = (
-                re.findall(r"\((.*?)\)", download.suggested_filename)[-1] + ".png"
-            )
-            save_path = os.path.join(output_path, suggested_name)
+            save_path = os.path.join(output_path, file_id(download) + ".png")
             download.save_as(save_path)
 
         print("Closing browser...")
         browser.close()
+
+        still_missing = missing_ids - {file_id(d) for d in downloads}
+        if still_missing:
+            raise RuntimeError(
+                f"⛔ Still missing {len(still_missing)} of {len(missing_ids)} images. "
+                "Run the same command again to fetch just the missing ones."
+            )
 
 
 def organize_sets(output_path, cards):
@@ -183,10 +273,21 @@ def create_csv(output_path, n_sets):
 def run():
     print("Parsing arguments " + "=" * 52)
     input_path, output_path = parse_args()
-    download_count, cards = parse_xml(input_path)
+    _, cards = parse_xml(input_path)
 
     print("Requesting files " + "=" * 53)
-    request_mpcfill(input_path, output_path, download_count)
+    expected, missing = get_missing_ids(output_path, cards)
+    if not missing:
+        print("All images already downloaded, skipping download.")
+    else:
+        upload_path = input_path
+        if missing != expected:
+            print(
+                f"Resuming: {len(expected) - len(missing)} images already "
+                f"downloaded, fetching the remaining {len(missing)}."
+            )
+            upload_path = build_partial_xml(input_path, output_path, missing)
+        request_mpcfill(upload_path, output_path, missing)
 
     print("Organizing sets " + "=" * 54)
     n_sets = organize_sets(output_path, cards)
