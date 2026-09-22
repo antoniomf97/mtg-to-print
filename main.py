@@ -1,25 +1,60 @@
-import os, sys, re
+# mtg-to-print — build print-ready image sets and data-merge files from MPCFill orders.
+# Copyright (C) 2026 antoniomf97
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import os, re, sys
+import argparse
+import shutil
+
 import xmltodict
 from playwright.sync_api import sync_playwright
 from tqdm import tqdm
-import shutil
+
+INPUT_DIR = "./input"
+OUTPUT_DIR = "./output"
 
 
-def parse_args():
-    if len(sys.argv) != 2:
-        raise ValueError(
-            f"⛔ Invalid input. Run as: 'python {sys.argv[0]} <input_file>'"
-        )
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Download, organize and build print files for MPCFill orders."
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        help="input XML file from ./input, or 'clean' to delete all inputs and outputs",
+    )
+    parser.add_argument("-d", action="store_true", help="download the card images")
+    parser.add_argument("-o", action="store_true", help="organize the images into sets")
+    parser.add_argument("-c", action="store_true", help="create the CSV data merge files")
+    parser.add_argument(
+        "-f", action="store_true", help="force steps to run even if already done"
+    )
+    parser.add_argument(
+        "-all",
+        dest="all",
+        action="store_true",
+        help="process every XML file in ./input",
+    )
+    args = parser.parse_args(argv)
 
-    filename = sys.argv[1] + ".xml" if ".xml" not in sys.argv[1] else sys.argv[1]
+    if args.file and args.all:
+        parser.error("cannot combine an input file with -all")
+    if not args.file and not args.all:
+        parser.error("provide an input file, 'clean' or -all")
 
-    input_path = "./input/" + filename
-    output_path = "./output/" + filename[:-4]
-
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"⛔ Path {input_path} does not exist.")
-
-    return input_path, output_path
+    return args
 
 
 def download_counter(data):
@@ -52,7 +87,7 @@ def download_counter(data):
 
     cardback = data["cardback"] if cardback_bool else None
 
-    return len(fronts) + len(backs) + cardback_bool, (front_dict, back_dict, cardback)
+    return front_dict, back_dict, cardback
 
 
 def parse_xml(file_path):
@@ -217,8 +252,8 @@ def organize_sets(output_path, cards):
         set_counter += 1
         os.makedirs(os.path.join(output_path, f"set{set_counter}"), exist_ok=True)
         shutil.copy2(
-            os.path.join(output_path, id + ".png"), 
-            os.path.join(output_path, f"set{set_counter}", "zzback.png")
+            os.path.join(output_path, id + ".png"),
+            os.path.join(output_path, f"set{set_counter}", "zzback.png"),
         )
         for slot in slots:
             shutil.copy2(
@@ -233,13 +268,13 @@ def organize_sets(output_path, cards):
         os.makedirs(os.path.join(output_path, f"set{set_counter}"), exist_ok=True)
         shutil.copy2(
             os.path.join(output_path, f"{cardback}.png"),
-            os.path.join(output_path, f"set{set_counter}", "zzback.png")
+            os.path.join(output_path, f"set{set_counter}", "zzback.png"),
         )
         for slot, id in fronts.items():
             if slot not in used_slots:
                 shutil.copy2(
                     os.path.join(output_path, id + ".png"),
-                    os.path.join(output_path, f"set{set_counter}", f"{card_counter}.png")
+                    os.path.join(output_path, f"set{set_counter}", f"{card_counter}.png"),
                 )
                 card_counter += 1
 
@@ -270,31 +305,135 @@ def create_csv(output_path, n_sets):
         print(f"✅ CSV file created successfully at {path}")
 
 
-def run():
-    print("Parsing arguments " + "=" * 52)
-    input_path, output_path = parse_args()
-    _, cards = parse_xml(input_path)
+def count_sets(output_path):
+    if not os.path.isdir(output_path):
+        return 0
+    return len(
+        [
+            entry
+            for entry in os.listdir(output_path)
+            if re.fullmatch(r"set\d+", entry)
+            and os.path.isdir(os.path.join(output_path, entry))
+        ]
+    )
 
-    print("Requesting files " + "=" * 53)
-    expected, missing = get_missing_ids(output_path, cards)
-    if not missing:
-        print("All images already downloaded, skipping download.")
+
+def list_csvs(output_path):
+    if not os.path.isdir(output_path):
+        return []
+    return [f for f in os.listdir(output_path) if f.endswith(".csv")]
+
+
+def clean():
+    try:
+        answer = input(
+            f"⚠️ This will delete everything in '{INPUT_DIR}' and '{OUTPUT_DIR}'. "
+            "Are you sure? [y/N] "
+        )
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ["y", "yes"]:
+        print("Aborted, nothing deleted.")
+        return
+
+    for folder in [INPUT_DIR, OUTPUT_DIR]:
+        if not os.path.isdir(folder):
+            continue
+        for entry in os.listdir(folder):
+            path = os.path.join(folder, entry)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+    print("✅ Deleted all inputs and outputs.")
+
+
+def process(filename, steps, force):
+    input_path = os.path.join(INPUT_DIR, filename)
+    output_path = os.path.join(OUTPUT_DIR, filename[:-4])
+
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"⛔ Path {input_path} does not exist.")
+
+    print(f"Processing {filename} " + "=" * max(0, 58 - len(filename)))
+    cards = parse_xml(input_path)
+
+    if "download" in steps:
+        print("Requesting files " + "=" * 53)
+        expected, missing = get_missing_ids(output_path, cards)
+        if force:
+            missing = expected
+        if count_sets(output_path) and not force:
+            print("✅ Images already organized, skipping download.")
+        elif not missing:
+            print("✅ Download already done, skipping.")
+        else:
+            upload_path = input_path
+            if missing != expected:
+                print(
+                    f"Resuming: {len(expected) - len(missing)} images already "
+                    f"downloaded, fetching the remaining {len(missing)}."
+                )
+                upload_path = build_partial_xml(input_path, output_path, missing)
+            request_mpcfill(upload_path, output_path, missing)
+
+    if "organize" in steps:
+        print("Organizing sets " + "=" * 54)
+        if count_sets(output_path) and not force:
+            print("✅ Sets already organized, skipping.")
+        else:
+            _, missing = get_missing_ids(output_path, cards)
+            if missing:
+                print(f"⛔ {len(missing)} images missing, run the download first (-d).")
+            else:
+                for i in range(count_sets(output_path)):
+                    shutil.rmtree(os.path.join(output_path, f"set{i + 1}"))
+                organize_sets(output_path, cards)
+
+    if "csv" in steps:
+        print("Building data merge files " + "=" * 44)
+        n_sets = count_sets(output_path)
+        if not n_sets:
+            print("⛔ No sets found, run the organization first (-o).")
+        elif list_csvs(output_path) and not force:
+            print("✅ CSV files already created, skipping.")
+        else:
+            create_csv(output_path, n_sets)
+
+
+def run(argv=None):
+    args = parse_args(argv)
+
+    if args.file == "clean":
+        clean()
+        return
+
+    steps = []
+    if args.d:
+        steps.append("download")
+    if args.o:
+        steps.append("organize")
+    if args.c:
+        steps.append("csv")
+    if not steps:
+        steps = ["download", "organize", "csv"]
+
+    if args.all:
+        files = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".xml"))
+        if not files:
+            raise FileNotFoundError(f"⛔ No XML files found in {INPUT_DIR}.")
     else:
-        upload_path = input_path
-        if missing != expected:
-            print(
-                f"Resuming: {len(expected) - len(missing)} images already "
-                f"downloaded, fetching the remaining {len(missing)}."
-            )
-            upload_path = build_partial_xml(input_path, output_path, missing)
-        request_mpcfill(upload_path, output_path, missing)
+        files = [args.file if args.file.endswith(".xml") else args.file + ".xml"]
 
-    print("Organizing sets " + "=" * 54)
-    n_sets = organize_sets(output_path, cards)
-
-    print("Building data merge files " + "=" * 44)          
-    create_csv(output_path, n_sets)
+    for filename in files:
+        process(filename, steps, args.f)
 
 
 if __name__ == "__main__":
+    try:
+        # piped output on Windows defaults to cp1252, which can't print emojis
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
     run()
