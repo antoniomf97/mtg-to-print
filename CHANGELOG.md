@@ -17,14 +17,22 @@ the released versions below were reconstructed from the commit history and dated
 - `-all` to process every `.xml` file in `input/` in one invocation, sorted by filename.
 - `clean` command to wipe `input/` and `output/`, guarded by a confirmation prompt that aborts on
   anything other than `y`/`yes` (including EOF, so it is safe in non-interactive shells).
-- Pytest suite (33 tests) covering argument parsing, slot/back resolution, resume-file
-  generation, set organization, CSV output and step skipping. `request_mpcfill` is stubbed, so the
+- Pytest suite (36 tests) covering argument parsing, slot/back resolution, downloading, set
+  organization, CSV output and step skipping. Google Drive and the Apps Script are faked, so the
   suite runs offline.
 - `README.md` and this changelog.
 - GNU General Public License v3.0 (or later): full text in `LICENSE`, notice header in `main.py`.
 
 ### Changed
 
+- Images are downloaded straight from Google Drive by the IDs in the order XML, four at a time,
+  instead of by driving mpcfill.com's editor in a headless browser. Files Drive refuses to serve
+  are fetched through the Google Apps Script that mpcfill.com uses for its own downloads. Either
+  way the files are byte-for-byte the ones the browser used to save.
+- Each image is saved as soon as it arrives, so an interrupted download resumes from the last
+  saved image instead of losing everything fetched in that browser session.
+- Cards that can't be downloaded are listed by name at the end of the run, after every other
+  image has been fetched.
 - Each step now detects its own prior output and skips: download is skipped once every image is
   present (or the images are already organized into sets), organize is skipped once sets exist,
   and CSV generation is skipped once CSVs exist. `-f` overrides all three.
@@ -38,6 +46,19 @@ the released versions below were reconstructed from the commit history and dated
   set of IDs from the front/back/cardback mapping.
 - stdout/stderr are reconfigured to UTF-8 on startup, so the status emoji no longer crash the run
   when output is piped on Windows (cp1252).
+
+### Removed
+
+- Playwright and its Firefox build, along with the trimmed `_resume.xml` upload, the fixed
+  15-second wait after uploading and the 240-second stall detection. All of these existed only to
+  manage the browser session.
+
+### Fixed
+
+- Large orders downloading no images at all. mpcfill.com's "Card Images" button crashes on the
+  first card whose details its editor hasn't loaded. The fixed 15-second wait was too short for a
+  530-card order to finish loading, and a card the editor's search can't find stopped the queue at
+  that card no matter how long the tool waited.
 
 ## [0.3.0] - 2026-07-08
 

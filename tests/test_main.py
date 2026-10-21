@@ -1,7 +1,9 @@
+import base64
 import builtins
 import os
 
 import pytest
+import requests
 import xmltodict
 
 import main
@@ -154,43 +156,95 @@ def test_get_missing_ids_missing_output_dir(tmp_path):
     assert missing == expected
 
 
-# ---------------- build_partial_xml ----------------
+# ---------------- card_names / download_images ----------------
+
+JPEG = b"\xff\xd8\xff\xe0 fake jpeg"
+PNG = b"\x89PNG\r\n\x1a\n fake png"
+QUOTA_PAGE = b"<!DOCTYPE html><html>Too many users have downloaded this file</html>"
 
 
-def test_build_partial_xml(tmp_path):
-    input_xml = tmp_path / "order.xml"
+class FakeResponse:
+    def __init__(self, content, status=200):
+        self.content = content
+        self.text = content.decode("latin-1")
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+
+@pytest.fixture
+def network(monkeypatch):
+    """Fake Drive and Apps Script, each a dict of id -> FakeResponse or exception to raise.
+
+    Ids a source doesn't serve get a 404. Every request is logged as (source, id).
+    """
+    drive, script, requested = {}, {}, []
+
+    def get(url, params=None, timeout=None):
+        assert url in (main.DRIVE_URL, main.SCRIPT_URL)
+        source, served = ("drive", drive) if url == main.DRIVE_URL else ("script", script)
+        requested.append((source, params["id"]))
+        response = served.get(params["id"], FakeResponse(b"Not Found", status=404))
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(main.requests, "get", get)
+    return drive, script, requested
+
+
+def test_card_names(tmp_path):
+    xml_path = tmp_path / "order.xml"
     write_order_xml(
-        input_xml,
-        [card("A", "0"), card("B", "1")],
-        backs=[card("BK", "1")],
+        xml_path,
+        [card("A", "0", "Alpha.jpg")],
+        backs=[card("BK", "0", "Back.png")],
         cardback="CB",
     )
-    out_dir = tmp_path / "out"
-    resume_path = main.build_partial_xml(str(input_xml), str(out_dir), {"B", "BK", "CB"})
-
-    with open(resume_path, encoding="utf-8") as file:
-        order = xmltodict.parse(file.read())["order"]
-
-    entries = order["fronts"]["card"]
-    assert {e["id"] for e in entries} == {"B", "BK", "CB"}
-    assert sorted(int(e["slots"]) for e in entries) == [0, 1, 2]
-    assert int(order["details"]["quantity"]) == 3
-    assert order["cardback"] == "CB"
-    assert "backs" not in order
+    assert main.card_names(str(xml_path)) == {
+        "A": "Alpha.jpg",
+        "BK": "Back.png",
+        "CB": "cardback",
+    }
 
 
-def test_build_partial_xml_single_missing_card(tmp_path):
-    input_xml = tmp_path / "order.xml"
-    write_order_xml(input_xml, [card("A", "0"), card("B", "1")], cardback="CB")
-    resume_path = main.build_partial_xml(str(input_xml), str(tmp_path / "out"), {"B"})
+def test_download_images_from_drive(tmp_path, network):
+    drive, _, requested = network
+    drive.update({"A": FakeResponse(JPEG), "B": FakeResponse(PNG)})
+    main.download_images(str(tmp_path), {"A", "B"}, {})
 
-    with open(resume_path, encoding="utf-8") as file:
-        order = xmltodict.parse(file.read())["order"]
+    assert (tmp_path / "A.png").read_bytes() == JPEG
+    assert (tmp_path / "B.png").read_bytes() == PNG
+    assert sorted(requested) == [("drive", "A"), ("drive", "B")]
+    assert not list(tmp_path.glob("*.part"))
 
-    entry = order["fronts"]["card"]
-    assert entry["id"] == "B"
-    assert entry["slots"] == "0"
-    assert int(order["details"]["quantity"]) == 1
+
+def test_download_images_falls_back_to_script(tmp_path, network):
+    drive, script, _ = network
+    drive["A"] = FakeResponse(QUOTA_PAGE)  # Drive answers 200 with an HTML page
+    drive["B"] = requests.ConnectionError("connection reset")
+    script["A"] = FakeResponse(base64.b64encode(JPEG))
+    script["B"] = FakeResponse(base64.b64encode(PNG))
+    main.download_images(str(tmp_path), {"A", "B"}, {})
+
+    assert (tmp_path / "A.png").read_bytes() == JPEG
+    assert (tmp_path / "B.png").read_bytes() == PNG
+
+
+def test_download_images_names_failures_and_keeps_the_rest(tmp_path, network, capsys):
+    drive, script, _ = network
+    drive["A"] = FakeResponse(JPEG)
+    drive["B"] = FakeResponse(QUOTA_PAGE, status=403)
+    script["B"] = FakeResponse(b"<html>Exception: file not found</html>")
+    with pytest.raises(RuntimeError, match="1 of 2 images failed"):
+        main.download_images(str(tmp_path), {"A", "B"}, {"B": "Agate Instigator.jpeg"})
+
+    assert "Agate Instigator.jpeg (B)" in capsys.readouterr().out
+    assert (tmp_path / "A.png").read_bytes() == JPEG
+    # nothing on disk for B, so the next run retries it
+    assert not (tmp_path / "B.png").exists()
 
 
 # ---------------- organize_sets / create_csv ----------------
@@ -285,21 +339,22 @@ def test_process_skips_download_when_all_images_present(project, monkeypatch):
     touch(out / "A.png")
     touch(out / "CB.png")
     calls = []
-    monkeypatch.setattr(main, "request_mpcfill", lambda *a: calls.append(a))
+    monkeypatch.setattr(main, "download_images", lambda *a: calls.append(a))
     main.process("proj.xml", ["download"], force=False)
     assert calls == []
 
 
-def test_process_resumes_with_partial_xml(project, monkeypatch):
+def test_process_downloads_only_missing_images(project, monkeypatch):
     _, out = project
     touch(out / "A.png")
     calls = []
-    monkeypatch.setattr(main, "request_mpcfill", lambda *a: calls.append(a))
+    monkeypatch.setattr(main, "download_images", lambda *a: calls.append(a))
     main.process("proj.xml", ["download"], force=False)
 
-    ((upload_path, output_path, missing),) = calls
-    assert upload_path.endswith("_resume.xml")
-    assert missing == {"CB"}
+    ((output_path, ids, names),) = calls
+    assert output_path == str(out)
+    assert ids == {"CB"}
+    assert names["CB"] == "cardback"
 
 
 def test_process_force_redownloads_everything(project, monkeypatch):
@@ -307,19 +362,18 @@ def test_process_force_redownloads_everything(project, monkeypatch):
     touch(out / "A.png")
     touch(out / "CB.png")
     calls = []
-    monkeypatch.setattr(main, "request_mpcfill", lambda *a: calls.append(a))
+    monkeypatch.setattr(main, "download_images", lambda *a: calls.append(a))
     main.process("proj.xml", ["download"], force=True)
 
-    ((upload_path, _, missing),) = calls
-    assert upload_path == os.path.join(main.INPUT_DIR, "proj.xml")
-    assert missing == {"A", "CB"}
+    ((_, ids, _),) = calls
+    assert ids == {"A", "CB"}
 
 
 def test_process_skips_download_when_already_organized(project, monkeypatch):
     _, out = project
     (out / "set1").mkdir()
     calls = []
-    monkeypatch.setattr(main, "request_mpcfill", lambda *a: calls.append(a))
+    monkeypatch.setattr(main, "download_images", lambda *a: calls.append(a))
     main.process("proj.xml", ["download"], force=False)
     assert calls == []
 
@@ -352,6 +406,18 @@ def test_process_organize_and_csv_offline(project):
     before = (out / "proj_set1.csv").read_text()
     main.process("proj.xml", ["organize", "csv"], force=False)
     assert (out / "proj_set1.csv").read_text() == before
+
+
+def test_process_full_pipeline_with_fake_network(project, network):
+    _, out = project
+    drive, _, _ = network
+    drive.update({"A": FakeResponse(JPEG), "CB": FakeResponse(PNG)})
+
+    main.process("proj.xml", ["download", "organize", "csv"], force=False)
+
+    assert (out / "set1" / "1.png").read_bytes() == JPEG
+    assert (out / "set1" / "zzback.png").read_bytes() == PNG
+    assert main.list_csvs(str(out)) == ["proj_set1.csv"]
 
 
 def test_process_missing_input_file(fake_dirs):
