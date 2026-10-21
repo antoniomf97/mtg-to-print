@@ -7,8 +7,8 @@ If you print at home (or at a local shop) you need those images grouped by the c
 share, numbered in a stable order, and referenced from a data-merge file. This tool does that
 end to end:
 
-1. **Download** — drives mpcfill.com in a headless Firefox (Playwright), uploads your order
-   XML and collects every card image.
+1. **Download** — fetches every card image in your order straight from Google Drive, using
+   the image IDs in the order XML.
 2. **Organize** — copies the images into one folder per cardback (`set1`, `set2`, …), with the
    fronts numbered `1.png`, `2.png`, … and the shared back saved as `zzback.png`.
 3. **CSV** — writes one data-merge CSV per set, with an `@image` column of absolute paths that
@@ -22,7 +22,6 @@ where it left off.
 ## Requirements
 
 - Python 3.9+ (developed on 3.13)
-- A Playwright-managed Firefox build (installed below)
 
 ## Installation
 
@@ -35,7 +34,6 @@ venv\Scripts\activate          # Windows
 # source venv/bin/activate     # macOS / Linux
 
 pip install -r requirements.txt
-playwright install firefox
 ```
 
 ## Getting an order XML
@@ -122,21 +120,22 @@ sheet out by filename.
   all the remaining fronts.
 - An order where every slot has an explicit back produces no default-cardback set.
 
-## Resuming an interrupted download
+## How downloading works
 
-Downloads are matched against the IDs the XML expects, so the tool always knows what is still
-missing:
+Every image is fetched straight from Google Drive by the ID in the XML, four at a time, and
+saved to `output/<project>/` the moment it arrives. mpcfill.com itself isn't involved, so it
+doesn't matter whether its editor can still find every card in your order.
 
-- On a re-run it skips images already present in `output/<project>/`.
-- If only part of the order is missing, it writes a trimmed `_resume.xml` into the output folder
-  and uploads that instead — MPCFill then only serves the cards you still need.
-- If no new file arrives for 240 seconds, the run gives up rather than hanging forever, and
-  tells you to run the same command again.
-- If the browser session ends with images still missing, the run exits with an error naming how
-  many are outstanding. Re-running the same command fetches just those.
+- On a re-run, images already in `output/<project>/` are skipped, so an interrupted download
+  (Ctrl+C, a dropped connection, a laptop going to sleep) picks up where it stopped.
+- If Google Drive refuses a file (it rate-limits popular ones), the image is fetched through the
+  Google Apps Script that mpcfill.com uses for its own downloads instead. It returns the same
+  file, just more slowly.
+- If both fail, the run still finishes every other image, then names the cards it couldn't get
+  and exits with an error. Running the same command again retries just those.
 
-Large orders take a while — MPCFill serves the images one at a time and a 150-card order is
-normal to sit through. The progress bar tracks images received, not bytes.
+A 530-card order (539 images, 2.2 GB) took under 6 minutes in testing. The progress bar counts
+images, not bytes.
 
 ## Notes and caveats
 
@@ -150,7 +149,7 @@ normal to sit through. The progress bar tracks images received, not bytes.
 - **Nothing in `input/` or `output/` is tracked by git** — `.gitignore` excludes `*.xml`, `*.png`,
   `*.csv` and `*.pdf` project-wide.
 - **Card images are named by their Google Drive ID** while downloading (`<id>.png`); the friendly
-  card names from the XML are only used to build the resume file.
+  card names from the XML only appear in error messages.
 
 ## Development
 
@@ -158,10 +157,10 @@ normal to sit through. The progress bar tracks images received, not bytes.
 python -m pytest tests -q
 ```
 
-The suite (33 tests) covers argument parsing, XML/slot handling, resume-file generation, set
-organization, CSV output and the step-skipping logic in `process()`. `request_mpcfill` — the only
-function that touches the network — is monkeypatched out, so the tests run offline and in well
-under a second.
+The suite (36 tests) covers argument parsing, XML/slot handling, downloading (including the
+Apps Script fallback and failed cards), set organization, CSV output and the step-skipping logic
+in `process()`. Google Drive and the Apps Script are replaced by a fake that serves canned
+responses, so the tests run offline and in well under a second.
 
 Formatting is [black](https://black.readthedocs.io/) (pinned in `requirements.txt`, run with
 `-l 90` to match the existing style):

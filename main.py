@@ -16,14 +16,28 @@
 
 import os, re, sys
 import argparse
+import base64
+import binascii
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 import xmltodict
-from playwright.sync_api import sync_playwright
 from tqdm import tqdm
 
 INPUT_DIR = "./input"
 OUTPUT_DIR = "./output"
+
+# Images are fetched straight from Google Drive by their ID. mpcfill.com downloads through
+# this Apps Script, which returns the same file base64-encoded but more slowly, so it is
+# only the fallback for files Drive refuses to serve.
+DRIVE_URL = "https://drive.google.com/uc"
+SCRIPT_URL = (
+    "https://script.google.com/macros/s/"
+    "AKfycbw8laScKBfxda2Wb0g63gkYDBdy8NWNxINoC4xDOwnCQ3JMFdruam1MdmNmN4wI5k4/exec"
+)
+PARALLEL_DOWNLOADS = 4
+TIMEOUT = 120  # seconds to wait on a stalled request before trying the next source
 
 
 def parse_args(argv=None):
@@ -116,12 +130,11 @@ def get_missing_ids(output_path, cards):
     return expected, missing
 
 
-def build_partial_xml(input_path, output_path, missing_ids):
-    with open(input_path, "r", encoding="utf-8") as file:
+def card_names(file_path):
+    with open(file_path, "r", encoding="utf-8") as file:
         data = xmltodict.parse(file.read())["order"]
 
-    entries = []
-    seen = set()
+    names = {}
     for section in ["fronts", "backs"]:
         cards = data.get(section)
         if not cards:
@@ -129,118 +142,80 @@ def build_partial_xml(input_path, output_path, missing_ids):
         cards = cards["card"]
         cards = cards if type(cards) == list else [cards]
         for card in cards:
-            if card["id"] in missing_ids and card["id"] not in seen:
-                entries.append(
-                    {
-                        "id": card["id"],
-                        "slots": str(len(entries)),
-                        "name": card["name"],
-                        "query": card.get("query"),
-                    }
-                )
-                seen.add(card["id"])
+            names[card["id"]] = card["name"]
+    if data.get("cardback"):
+        names[data["cardback"]] = "cardback"
 
-    cardback = data.get("cardback")
-    if cardback and cardback in missing_ids and cardback not in seen:
-        entries.append(
-            {
-                "id": cardback,
-                "slots": str(len(entries)),
-                "name": "cardback.png",
-                "query": None,
-            }
+    return names
+
+
+def from_drive(id):
+    response = requests.get(
+        DRIVE_URL, params={"id": id, "export": "download"}, timeout=TIMEOUT
+    )
+    response.raise_for_status()
+    return response.content
+
+
+def from_script(id):
+    response = requests.get(SCRIPT_URL, params={"id": id}, timeout=TIMEOUT)
+    response.raise_for_status()
+    return base64.b64decode(response.text)
+
+
+def is_image(data):
+    # MPCFill only indexes PNG and JPEG files; anything else is an error or quota page
+    return data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"))
+
+
+def fetch_image(id):
+    for source in (from_drive, from_script):
+        try:
+            data = source(id)
+        except (requests.RequestException, binascii.Error):
+            continue
+        if is_image(data):
+            return data
+    return None
+
+
+def download_image(output_path, id):
+    data = fetch_image(id)
+    if data is None:
+        return False
+
+    # write under a temporary name first, so an interrupted write never looks downloaded
+    path = os.path.join(output_path, id + ".png")
+    with open(path + ".part", "wb") as file:
+        file.write(data)
+    os.replace(path + ".part", path)
+    return True
+
+
+def download_images(output_path, ids, names):
+    print(f"Downloading {len(ids)} images from Google Drive...")
+    os.makedirs(output_path, exist_ok=True)
+
+    failed = []
+    pool = ThreadPoolExecutor(PARALLEL_DOWNLOADS)
+    try:
+        jobs = {pool.submit(download_image, output_path, id): id for id in sorted(ids)}
+        for job in tqdm(as_completed(jobs), total=len(jobs)):
+            if not job.result():
+                failed.append(jobs[job])
+    finally:
+        # on Ctrl+C, let the downloads in flight finish saving but drop the queued ones
+        pool.shutdown(cancel_futures=True)
+
+    if failed:
+        for id in sorted(failed, key=lambda id: names.get(id, id)):
+            print(f"⛔ Could not download {names.get(id, id)} ({id}).")
+        raise RuntimeError(
+            f"⛔ {len(failed)} of {len(ids)} images failed. "
+            "Run the same command again to retry just those."
         )
 
-    order = {
-        "order": {
-            "details": {
-                "quantity": len(entries),
-                "bracket": data["details"]["bracket"],
-                "stock": data["details"]["stock"],
-                "foil": data["details"]["foil"],
-            },
-            "fronts": {"card": entries},
-        }
-    }
-    if cardback:
-        order["order"]["cardback"] = cardback
-
-    os.makedirs(output_path, exist_ok=True)
-    resume_path = os.path.join(output_path, "_resume.xml")
-    with open(resume_path, "w", encoding="utf-8") as file:
-        file.write(xmltodict.unparse(order, pretty=True))
-
-    return resume_path
-
-
-def request_mpcfill(upload_path, output_path, missing_ids):
-
-    with sync_playwright() as p:
-        print("Lauching browser...")
-        browser = p.firefox.launch(headless=True)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
-
-        print("Opening MPCFill editor...")
-        page.goto("https://mpcfill.com/editor", timeout=600000)
-
-        page.get_by_role("button", name="Add Cards").click()
-        page.get_by_text("XML", exact=True).click()
-        page.get_by_text("Retain Selected Cardback", exact=True).click()
-        page.get_by_text("Retain Selected Finish Settings", exact=True).click()
-
-        print("Uploading XML file...")
-        page.locator("input[type='file']").set_input_files(upload_path)
-
-        print("Waiting for upload to settle...")
-        page.wait_for_timeout(15000)  # adjust if needed (e.g., 3–10 seconds)
-
-        downloads = []
-        page.on("download", lambda d: downloads.append(d))
-
-        def file_id(download):
-            found = re.findall(r"\((.*?)\)", download.suggested_filename)
-            if found:
-                return found[-1]
-            return os.path.splitext(download.suggested_filename)[0]
-
-        print("Starting downloads...")
-        page.locator("button.dropdown-toggle:has-text('Download')").click()
-        page.get_by_text("Card Images", exact=True).click()
-
-        print("Waiting for downloads...")
-        stall_limit = 240  # seconds without a new download before giving up
-        stalled = 0.0
-        with tqdm(total=len(missing_ids)) as progress:
-            while progress.n < len(missing_ids):
-                page.wait_for_timeout(500)
-                received = len(missing_ids & {file_id(d) for d in downloads})
-                if received > progress.n:
-                    progress.update(received - progress.n)
-                    stalled = 0.0
-                else:
-                    stalled += 0.5
-                    if stalled >= stall_limit:
-                        print(f"⚠️ No new download for {stall_limit}s, giving up.")
-                        break
-
-        print(f"Received {len(downloads)} files.")
-
-        print(f"Saving files at '{output_path}'.")
-        os.makedirs(output_path, exist_ok=True)
-        for download in downloads:
-            save_path = os.path.join(output_path, file_id(download) + ".png")
-            download.save_as(save_path)
-
-        print("Closing browser...")
-        browser.close()
-
-        still_missing = missing_ids - {file_id(d) for d in downloads}
-        if still_missing:
-            raise RuntimeError(
-                f"⛔ Still missing {len(still_missing)} of {len(missing_ids)} images. "
-                "Run the same command again to fetch just the missing ones."
-            )
+    print(f"✅ Downloaded {len(ids)} images.")
 
 
 def organize_sets(output_path, cards):
@@ -368,14 +343,12 @@ def process(filename, steps, force):
         elif not missing:
             print("✅ Download already done, skipping.")
         else:
-            upload_path = input_path
             if missing != expected:
                 print(
                     f"Resuming: {len(expected) - len(missing)} images already "
                     f"downloaded, fetching the remaining {len(missing)}."
                 )
-                upload_path = build_partial_xml(input_path, output_path, missing)
-            request_mpcfill(upload_path, output_path, missing)
+            download_images(output_path, missing, card_names(input_path))
 
     if "organize" in steps:
         print("Organizing sets " + "=" * 54)
