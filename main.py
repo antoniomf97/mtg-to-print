@@ -193,7 +193,7 @@ def request_mpcfill(upload_path, output_path, missing_ids):
         page.locator("input[type='file']").set_input_files(upload_path)
 
         print("Waiting for upload to settle...")
-        page.wait_for_timeout(10000)  # adjust if needed (e.g., 3–10 seconds)
+        page.wait_for_timeout(15000)  # adjust if needed (e.g., 3–10 seconds)
 
         downloads = []
         page.on("download", lambda d: downloads.append(d))
