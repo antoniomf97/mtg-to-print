@@ -42,6 +42,11 @@ pip install -r requirements.txt
 2. Use **Download → XML** to export it.
 3. Drop the file into `input/`, e.g. `input/cards1.xml`.
 
+Any file name works. The first time the tool runs on a file, it renames it to lowercase letters
+and digits only, dropping spaces, punctuation and accents: `Tannuk, Matheus (2).xml` becomes
+`tannukmatheus2.xml`. The output folder and CSVs get the same clean name, because spaces, commas
+and brackets in those paths break the data merge.
+
 The XML is the single source of truth for the run — it carries the card IDs, the slot each card
 occupies, the per-slot backs, and the default cardback.
 
@@ -51,7 +56,9 @@ occupies, the per-slot backs, and the default cardback.
 python main.py cards1
 ```
 
-That runs all three steps for `input/cards1.xml`. The `.xml` extension is optional.
+That runs all three steps for `input/cards1.xml`. The `.xml` extension is optional, and you can
+type a name either as it was or cleaned: `python main.py "Tannuk, Matheus (2)"` and
+`python main.py tannukmatheus2` find the same file.
 
 ### Running individual steps
 
@@ -150,6 +157,13 @@ images, not bytes.
   `*.csv` and `*.pdf` project-wide.
 - **Card images are named by their Google Drive ID** while downloading (`<id>.png`); the friendly
   card names from the XML only appear in error messages.
+- **Output folders from before names were cleaned are adopted.** If `output/` has a folder whose
+  cleaned name matches the order (`Beast Victor/` for `beastvictor.xml`), it is renamed to the
+  clean name and its CSVs are rebuilt, since they contain the folder's path. Nothing is downloaded
+  again, but InDesign documents linked to the old CSVs need relinking.
+- **Names that clean to the same thing stop the run.** If `Deck 1.xml` and `deck1.xml` are both in
+  `input/`, the tool names them and renames neither; the same goes for two matching output
+  folders.
 
 ## Development
 
@@ -157,8 +171,8 @@ images, not bytes.
 python -m pytest tests -q
 ```
 
-The suite (36 tests) covers argument parsing, XML/slot handling, downloading (including the
-Apps Script fallback and failed cards), set organization, CSV output and the step-skipping logic
+The suite (44 tests) covers argument parsing, XML/slot handling, name cleaning, downloading
+(including the Apps Script fallback and failed cards), set organization, CSV output and the step-skipping logic
 in `process()`. Google Drive and the Apps Script are replaced by a fake that serves canned
 responses, so the tests run offline and in well under a second.
 

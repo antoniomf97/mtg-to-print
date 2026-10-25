@@ -331,6 +331,85 @@ def test_clean_deletes_everything_on_yes(fake_dirs, monkeypatch):
     assert list(output_dir.iterdir()) == []
 
 
+# ---------------- clean names ----------------
+
+
+def test_clean_name():
+    assert main.clean_name("Tannuk, matheus") == "tannukmatheus"
+    assert main.clean_name("Eldrazi Victor(1)") == "eldrazivictor1"
+    assert main.clean_name("cards_deadpool_jhony") == "cardsdeadpooljhony"
+    assert main.clean_name("Cão e Gato") == "caoegato"
+
+
+def test_process_renames_input_and_uses_clean_output(fake_dirs, monkeypatch):
+    input_dir, output_dir = fake_dirs
+    write_order_xml(input_dir / "Tannuk, Matheus (2).xml", [card("A", "0")], cardback="CB")
+    calls = []
+    monkeypatch.setattr(main, "download_images", lambda *a: calls.append(a))
+    main.process("Tannuk, Matheus (2).xml", ["download"], force=False)
+
+    assert os.listdir(input_dir) == ["tannukmatheus2.xml"]
+    ((output_path, _, _),) = calls
+    assert output_path == os.path.join(str(output_dir), "tannukmatheus2")
+
+
+def test_process_finds_input_by_clean_name(fake_dirs):
+    input_dir, _ = fake_dirs
+    write_order_xml(input_dir / "Beast Victor.xml", [card("A", "0")], cardback="CB")
+    main.process("beastvictor.xml", ["csv"], force=False)
+    assert os.listdir(input_dir) == ["beastvictor.xml"]
+
+
+def test_process_fixes_case_only_differences(fake_dirs):
+    input_dir, _ = fake_dirs
+    write_order_xml(input_dir / "CardsDM.xml", [card("A", "0")], cardback="CB")
+    main.process("CardsDM.xml", ["csv"], force=False)
+    assert os.listdir(input_dir) == ["cardsdm.xml"]
+
+
+def test_process_refuses_inputs_that_clash(fake_dirs):
+    input_dir, _ = fake_dirs
+    write_order_xml(input_dir / "Deck 1.xml", [card("A", "0")], cardback="CB")
+    write_order_xml(input_dir / "deck1.xml", [card("B", "0")], cardback="CB")
+    with pytest.raises(FileExistsError):
+        main.process("Deck 1.xml", ["csv"], force=False)
+    assert sorted(os.listdir(input_dir)) == ["Deck 1.xml", "deck1.xml"]
+
+
+def test_process_rejects_names_without_letters(fake_dirs):
+    with pytest.raises(ValueError):
+        main.process("!!!.xml", ["csv"], force=False)
+
+
+def test_process_adopts_output_folder_from_before_cleaning(fake_dirs):
+    input_dir, output_dir = fake_dirs
+    write_order_xml(input_dir / "Tannuk, matheus.xml", [card("A", "0")], cardback="CB")
+    # hand-renamed folder whose CSV still has the old name and old paths
+    old = output_dir / "Tannukmatheus"
+    (old / "set1").mkdir(parents=True)
+    touch(old / "set1" / "1.png")
+    touch(old / "set1" / "zzback.png")
+    touch(old / "Tannuk, matheus_set1.csv", "@image\nC:\\old\\path\\1.png\n")
+
+    main.process("Tannuk, matheus.xml", ["csv"], force=False)
+
+    new = output_dir / "tannukmatheus"
+    assert os.listdir(output_dir) == ["tannukmatheus"]
+    assert main.list_csvs(str(new)) == ["tannukmatheus_set1.csv"]
+    lines = (new / "tannukmatheus_set1.csv").read_text().splitlines()
+    assert lines[0] == "@image"
+    assert all(os.path.join("tannukmatheus", "set1") in line for line in lines[1:])
+
+
+def test_process_refuses_output_folders_that_clash(fake_dirs):
+    input_dir, output_dir = fake_dirs
+    write_order_xml(input_dir / "beastvictor.xml", [card("A", "0")], cardback="CB")
+    (output_dir / "Beast Victor").mkdir()
+    (output_dir / "beastvictor").mkdir()
+    with pytest.raises(FileExistsError):
+        main.process("beastvictor.xml", ["csv"], force=False)
+
+
 # ---------------- process: step skipping ----------------
 
 
@@ -432,7 +511,8 @@ def test_run_appends_xml_extension(fake_dirs, monkeypatch):
     processed = []
     monkeypatch.setattr(main, "process", lambda f, steps, force: processed.append(f))
     main.run(["proj"])
-    assert processed == ["proj.xml"]
+    main.run(["Proj.XML"])
+    assert processed == ["proj.xml", "Proj.XML"]
 
 
 def test_run_default_steps_are_all_steps(fake_dirs, monkeypatch):

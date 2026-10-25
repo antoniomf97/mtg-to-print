@@ -17,8 +17,13 @@ the released versions below were reconstructed from the commit history and dated
 - `-all` to process every `.xml` file in `input/` in one invocation, sorted by filename.
 - `clean` command to wipe `input/` and `output/`, guarded by a confirmation prompt that aborts on
   anything other than `y`/`yes` (including EOF, so it is safe in non-interactive shells).
-- Pytest suite (36 tests) covering argument parsing, slot/back resolution, downloading, set
-  organization, CSV output and step skipping. Google Drive and the Apps Script are faked, so the
+- Input file names are cleaned to lowercase letters and digits only, with spaces, punctuation
+  and accents removed, so output folders and CSV paths no longer break the data merge. The input
+  is renamed the first time it is processed, and either the original or the cleaned name finds it
+  on the command line. An existing output folder whose cleaned name matches is renamed to match,
+  with its CSVs rebuilt. Names that would clash stop the run instead of overwriting anything.
+- Pytest suite (44 tests) covering argument parsing, slot/back resolution, name cleaning,
+  downloading, set organization, CSV output and step skipping. Google Drive and the Apps Script are faked, so the
   suite runs offline.
 - `README.md` and this changelog.
 - GNU General Public License v3.0 (or later): full text in `LICENSE`, notice header in `main.py`.

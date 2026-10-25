@@ -19,6 +19,7 @@ import argparse
 import base64
 import binascii
 import shutil
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -323,14 +324,79 @@ def clean():
     print("✅ Deleted all inputs and outputs.")
 
 
+def clean_name(name):
+    # drop accents (ã -> a), then keep only lowercase letters and digits: spaces, commas
+    # and brackets in a project's paths break the data merge CSVs
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def clean_input(filename):
+    """Find the input file `filename` refers to and rename it to its clean name."""
+    clean = clean_name(filename[:-4])
+    if not clean:
+        raise ValueError(
+            f"⛔ '{filename}' has no letters or digits to name the project after."
+        )
+
+    # match on the clean name, so the original and the cleaned name both find the file
+    matches = [
+        f
+        for f in os.listdir(INPUT_DIR)
+        if f.lower().endswith(".xml") and clean_name(f[:-4]) == clean
+    ]
+    if not matches:
+        raise FileNotFoundError(f"⛔ No input file matching '{filename}' in {INPUT_DIR}.")
+    if len(matches) > 1:
+        raise FileExistsError(
+            f"⛔ {', '.join(sorted(matches))} would all become '{clean}.xml'. "
+            "Rename or remove all but one."
+        )
+
+    found = matches[0]
+    if found != clean + ".xml":
+        os.rename(os.path.join(INPUT_DIR, found), os.path.join(INPUT_DIR, clean + ".xml"))
+        print(f"Renamed input '{found}' to '{clean}.xml'.")
+    return clean + ".xml"
+
+
+def clean_output(output_path):
+    """Rename an output folder made before names were cleaned, e.g. 'Beast Victor'."""
+    clean = os.path.basename(output_path)
+    if not os.path.isdir(OUTPUT_DIR):
+        return
+
+    matches = [
+        d
+        for d in os.listdir(OUTPUT_DIR)
+        if clean_name(d) == clean and os.path.isdir(os.path.join(OUTPUT_DIR, d))
+    ]
+    if len(matches) > 1:
+        raise FileExistsError(
+            f"⛔ Output folders {', '.join(sorted(matches))} all belong to '{clean}'. "
+            "Remove or merge all but one."
+        )
+    if not matches or matches[0] == clean:
+        return
+
+    os.rename(os.path.join(OUTPUT_DIR, matches[0]), output_path)
+    print(f"Renamed output folder '{matches[0]}' to '{clean}'.")
+
+    # the CSVs hold absolute paths through the old folder name, so rebuild them
+    stale = list_csvs(output_path)
+    for csv in stale:
+        os.remove(os.path.join(output_path, csv))
+    if stale:
+        create_csv(output_path, count_sets(output_path))
+
+
 def process(filename, steps, force):
+    filename = clean_input(filename)
     input_path = os.path.join(INPUT_DIR, filename)
     output_path = os.path.join(OUTPUT_DIR, filename[:-4])
 
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"⛔ Path {input_path} does not exist.")
-
     print(f"Processing {filename} " + "=" * max(0, 58 - len(filename)))
+    clean_output(output_path)
     cards = parse_xml(input_path)
 
     if "download" in steps:
@@ -392,11 +458,12 @@ def run(argv=None):
         steps = ["download", "organize", "csv"]
 
     if args.all:
-        files = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".xml"))
+        files = sorted(f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".xml"))
         if not files:
             raise FileNotFoundError(f"⛔ No XML files found in {INPUT_DIR}.")
     else:
-        files = [args.file if args.file.endswith(".xml") else args.file + ".xml"]
+        file = args.file
+        files = [file if file.lower().endswith(".xml") else file + ".xml"]
 
     for filename in files:
         process(filename, steps, args.f)
